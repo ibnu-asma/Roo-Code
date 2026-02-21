@@ -1,6 +1,7 @@
 import { serializeError } from "serialize-error"
 import { Anthropic } from "@anthropic-ai/sdk"
-
+import * as fs from "fs/promises"
+import * as path from "path"
 import type { ToolName, ClineAsk, ToolProgressStatus } from "@roo-code/types"
 import { ConsecutiveMistakeError, TelemetryEventName } from "@roo-code/types"
 import { TelemetryService } from "@roo-code/telemetry"
@@ -134,6 +135,53 @@ export async function presentAssistantMessage(cline: Task) {
 			// Store approval feedback to merge into tool result (GitHub #10465)
 			let approvalFeedback: { text: string; images?: string[] } | undefined
 
+			// const pushToolResult = (content: ToolResponse, feedbackImages?: string[]) => {
+			// 	if (hasToolResult) {
+			// 		console.warn(
+			// 			`[presentAssistantMessage] Skipping duplicate tool_result for mcp_tool_use: ${toolCallId}`,
+			// 		)
+			// 		return
+			// 	}
+
+			// 	let resultContent: string
+			// 	let imageBlocks: Anthropic.ImageBlockParam[] = []
+
+			// 	if (typeof content === "string") {
+			// 		resultContent = content || "(tool did not return anything)"
+			// 	} else {
+			// 		const textBlocks = content.filter((item) => item.type === "text")
+			// 		imageBlocks = content.filter((item) => item.type === "image") as Anthropic.ImageBlockParam[]
+			// 		resultContent =
+			// 			textBlocks.map((item) => (item as Anthropic.TextBlockParam).text).join("\n") ||
+			// 			"(tool did not return anything)"
+			// 	}
+
+			// 	// Merge approval feedback into tool result (GitHub #10465)
+			// 	if (approvalFeedback) {
+			// 		const feedbackText = formatResponse.toolApprovedWithFeedback(approvalFeedback.text)
+			// 		resultContent = `${feedbackText}\n\n${resultContent}`
+
+			// 		// Add feedback images to the image blocks
+			// 		if (approvalFeedback.images) {
+			// 			const feedbackImageBlocks = formatResponse.imageBlocks(approvalFeedback.images)
+			// 			imageBlocks = [...feedbackImageBlocks, ...imageBlocks]
+			// 		}
+			// 	}
+
+			// 	if (toolCallId) {
+			// 		cline.pushToolResultToUserContent({
+			// 			type: "tool_result",
+			// 			tool_use_id: sanitizeToolUseId(toolCallId),
+			// 			content: resultContent,
+			// 		})
+
+			// 		if (imageBlocks.length > 0) {
+			// 			cline.userMessageContent.push(...imageBlocks)
+			// 		}
+			// 	}
+
+			// 	hasToolResult = true
+			// }
 			const pushToolResult = (content: ToolResponse, feedbackImages?: string[]) => {
 				if (hasToolResult) {
 					console.warn(
@@ -166,6 +214,26 @@ export async function presentAssistantMessage(cline: Task) {
 						imageBlocks = [...feedbackImageBlocks, ...imageBlocks]
 					}
 				}
+
+				// --- PHASE 4: LESSON RECORDING (THE SHARED BRAIN) ---
+				// If the tool result looks like an error (contains Error, ENOENT, or failed), record it.
+				// --- PHASE 4: LESSON RECORDING (SMART VERSION) ---
+				if (
+					resultContent.includes("Error") ||
+					resultContent.includes("ENOENT") ||
+					resultContent.includes("failed")
+				) {
+					const lessonPath = path.join(cline.cwd, "CLAUDE.md")
+					const timestamp = new Date().toISOString()
+
+					// Check if we have an intent, otherwise mark it as Pre-Handshake
+					const currentIntent = cline.activeIntentId ? cline.activeIntentId : "PRE-HANDSHAKE"
+
+					const lesson = `\n- [LESSON][${currentIntent}] ${timestamp}: Action failed. Message: ${resultContent.substring(0, 150)}...`
+
+					fs.appendFile(lessonPath, lesson).catch((err) => console.error("🚨 Failed to record lesson:", err))
+				}
+				// --- END OF PHASE 4 ---
 
 				if (toolCallId) {
 					cline.pushToolResultToUserContent({
@@ -220,17 +288,36 @@ export async function presentAssistantMessage(cline: Task) {
 				return true
 			}
 
+			// const handleError = async (action: string, error: Error) => {
+			// 	// Silently ignore AskIgnoredError - this is an internal control flow
+			// 	// signal, not an actual error. It occurs when a newer ask supersedes an older one.
+			// 	if (error instanceof AskIgnoredError) {
+			// 		return
+			// 	}
+			// 	const errorString = `Error ${action}: ${JSON.stringify(serializeError(error))}`
+			// 	await cline.say(
+			// 		"error",
+			// 		`Error ${action}:\n${error.message ?? JSON.stringify(serializeError(error), null, 2)}`,
+			// 	)
+			// 	pushToolResult(formatResponse.toolError(errorString))
+			// }
+
 			const handleError = async (action: string, error: Error) => {
-				// Silently ignore AskIgnoredError - this is an internal control flow
-				// signal, not an actual error. It occurs when a newer ask supersedes an older one.
-				if (error instanceof AskIgnoredError) {
-					return
+				if (error instanceof AskIgnoredError) return
+
+				// --- PHASE 4: LESSON RECORDING ---
+				const lessonPath = path.join(cline.cwd, "CLAUDE.md")
+				const lesson = `\n- [LESSON] ${new Date().toISOString()}: ${action} failed with error: ${error.message}. Avoid this pattern in future turns.`
+
+				try {
+					await fs.appendFile(lessonPath, lesson)
+					await cline.say("text", "🧠 Lesson recorded to the Shared Brain (CLAUDE.md)")
+				} catch (e) {
+					// Silent fail
 				}
+
 				const errorString = `Error ${action}: ${JSON.stringify(serializeError(error))}`
-				await cline.say(
-					"error",
-					`Error ${action}:\n${error.message ?? JSON.stringify(serializeError(error), null, 2)}`,
-				)
+				await cline.say("error", `Error ${action}:\n${error.message}`)
 				pushToolResult(formatResponse.toolError(errorString))
 			}
 
